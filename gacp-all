@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Run the equivalent of gacp for repositories whose remotes contain yuda."""
+
+import argparse
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+
+def git(repo, *args, capture=True):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    ).stdout
+
+
+def repositories(root):
+    found = []
+
+    def scan_error(error):
+        raise error
+
+    for directory, dirs, files in os.walk(root, onerror=scan_error):
+        has_git = ".git" in dirs or ".git" in files
+        if ".git" in dirs:
+            dirs.remove(".git")
+        if has_git:
+            repo = Path(directory)
+            # Also handles worktrees/submodules, where .git is a file.
+            try:
+                top = Path(git(repo, "rev-parse", "--show-toplevel").strip())
+            except subprocess.CalledProcessError:
+                continue
+            if top.resolve() == repo.resolve():
+                found.append(repo)
+    # Commit nested repositories before their parents (e.g. submodules).
+    return sorted(found, key=lambda p: (-len(p.parts), str(p)))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="remote -v に指定文字列を含む Git リポジトリで add / commit / push。"
+                    "デフォルトは確認表示のみ。push 先は gacp と同じ origin。"
+    )
+    parser.add_argument("message", help='コミットメッセージ（例: "all"）')
+    parser.add_argument("--execute", action="store_true", help="実際に実行する")
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent,
+                        help="探索先（デフォルト: このスクリプトのある src）")
+    parser.add_argument("--match", default="yuda", help="remote の部分一致文字列（既定: yuda）")
+    args = parser.parse_args()
+    if not args.root.is_dir() or not args.message.strip() or not args.match:
+        parser.error("探索先ディレクトリ、空でないメッセージ・検索文字列を指定してください")
+
+    matched, completed, skipped, failed = 0, 0, 0, []
+    for repo in repositories(args.root.resolve()):
+        try:
+            if args.match not in git(repo, "remote", "-v"):
+                continue
+            matched += 1
+            print("\n[{}] {}".format("実行" if args.execute else "確認", repo), flush=True)
+            branch = git(repo, "branch", "--show-current").strip()
+            if not branch:
+                raise RuntimeError("detached HEAD のためスキップ")
+            git(repo, "remote", "get-url", "--push", "origin")
+            if git(repo, "ls-files", "--unmerged").strip():
+                raise RuntimeError("未解決の競合があるためスキップ")
+            if not git(repo, "status", "--porcelain").strip():
+                print("  変更なし: スキップ", flush=True)
+                skipped += 1
+                continue
+            commands = [
+                ["add", "-A"],
+                ["commit", "-m", args.message],
+                ["push", "origin", branch],
+            ]
+            if not args.execute:
+                for command in commands:
+                    print("  " + shlex.join(["git", *command]), flush=True)
+                continue
+            git(repo, *commands[0], capture=False)
+            if not git(repo, "diff", "--cached", "--name-only").strip():
+                print("  コミット対象なし: スキップ", flush=True)
+                skipped += 1
+                continue
+            git(repo, *commands[1], capture=False)
+            git(repo, *commands[2], capture=False)
+            completed += 1
+        except (subprocess.CalledProcessError, RuntimeError) as error:
+            detail = (getattr(error, "stderr", None) or str(error)).strip()
+            print("  失敗: " + detail, file=sys.stderr, flush=True)
+            failed.append(repo)
+
+    print("\n対象: {} / 完了: {} / スキップ: {} / 失敗: {}".format(
+        matched, completed, skipped, len(failed)), flush=True)
+    for repo in failed:
+        print("  失敗: " + str(repo), flush=True)
+    if not args.execute:
+        print("確認表示のみです。実行するには --execute を付けてください。", flush=True)
+    elif failed:
+        print("push 失敗時も作成済みのコミットは残ります。該当リポジトリで "
+              "git push origin <ブランチ名> を再実行してください。", flush=True)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, KeyboardInterrupt) as error:
+        print("中断: {}".format(error), file=sys.stderr)
+        sys.exit(1)
